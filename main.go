@@ -9,11 +9,18 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"runtime"
 	"time"
 
+	//nolint:gosec
+	_ "net/http/pprof"
+
+	"github.com/elastic/otel-profiling-agent/containermetadata"
+	"github.com/elastic/otel-profiling-agent/platform"
+	"github.com/elastic/otel-profiling-agent/vc"
 	"golang.org/x/sys/unix"
 
 	"github.com/elastic/otel-profiling-agent/host"
@@ -31,9 +38,6 @@ import (
 	"github.com/elastic/otel-profiling-agent/tracer"
 
 	log "github.com/sirupsen/logrus"
-
-	"github.com/elastic/otel-profiling-agent/libpf/memorydebug"
-	"github.com/elastic/otel-profiling-agent/libpf/vc"
 )
 
 // Short copyright / license text for eBPF code
@@ -74,7 +78,14 @@ func startTraceHandling(ctx context.Context, rep reporter.TraceReporter,
 		return fmt.Errorf("failed to start map monitors: %v", err)
 	}
 
-	return tracehandler.Start(ctx, rep, trc, traceCh, times)
+	containerMetadataHandler, err := containermetadata.GetHandler(ctx, times.MonitorInterval())
+	if err != nil {
+		return fmt.Errorf("failed to create container metadata handler: %v", err)
+	}
+
+	_, err = tracehandler.Start(ctx, containerMetadataHandler, rep,
+		trc.TraceProcessor(), traceCh, times)
+	return err
 }
 
 func main() {
@@ -82,31 +93,29 @@ func main() {
 }
 
 func mainWithExitCode() exitCode {
-	err := parseArgs()
+	args, err := parseArgs()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failure to parse arguments: %s", err)
-		return exitParseError
+		return parseError("Failure to parse arguments: %v", err)
 	}
 
-	if argMapScaleFactor > 8 {
-		fmt.Fprintf(os.Stderr, "eBPF map scaling factor %d exceeds limit (max: %d)\n",
-			argMapScaleFactor, maxArgMapScaleFactor)
-		return exitParseError
-	}
-
-	if argCopyright {
+	if args.copyright {
 		fmt.Print(copyright)
 		return exitSuccess
 	}
 
-	if argVersion {
+	if args.version {
 		fmt.Printf("%s\n", vc.Version())
 		return exitSuccess
 	}
 
-	if argBpfVerifierLogLevel > 2 {
-		fmt.Fprintf(os.Stderr, "invalid eBPF verifier log level: %d", argBpfVerifierLogLevel)
-		return exitParseError
+	if args.verboseMode {
+		log.SetLevel(log.DebugLevel)
+		// Dump the arguments in debug mode.
+		args.dump()
+	}
+
+	if code := sanityCheck(args); code != exitSuccess {
+		return code
 	}
 
 	// Context to drive main goroutine and the Tracer monitors.
@@ -114,94 +123,46 @@ func mainWithExitCode() exitCode {
 		unix.SIGINT, unix.SIGTERM, unix.SIGABRT)
 	defer mainCancel()
 
-	// Sanity check for probabilistic profiling arguments
-	if argProbabilisticInterval < 1*time.Minute || argProbabilisticInterval > 5*time.Minute {
-		fmt.Fprintf(os.Stderr, "Invalid argument for probabilistic-interval: use "+
-			"a duration between 1 and 5 minutes")
-		return exitParseError
-	}
-	if argProbabilisticThreshold < 1 ||
-		argProbabilisticThreshold > tracer.ProbabilisticThresholdMax {
-		fmt.Fprintf(os.Stderr, "Invalid argument for probabilistic-threshold. Value "+
-			"should be between 1 and %d", tracer.ProbabilisticThresholdMax)
-		return exitParseError
-	}
-
-	if argVerboseMode {
-		log.SetLevel(log.DebugLevel)
-		// Dump the arguments in debug mode.
-		dumpArgs()
+	if args.pprofAddr != "" {
+		go func() {
+			//nolint:gosec
+			if err = http.ListenAndServe(args.pprofAddr, nil); err != nil {
+				log.Errorf("Serving pprof on %s failed: %s", args.pprofAddr, err)
+			}
+		}()
 	}
 
 	startTime := time.Now()
 	log.Infof("Starting OTEL profiling agent %s (revision %s, build timestamp %s)",
 		vc.Version(), vc.Revision(), vc.BuildTimestamp())
 
-	// Enable dumping of full heaps if the size of the allocated Golang heap
-	// exceeds 150m, and start dumping memory profiles when the heap exceeds
-	// 250m (only in debug builds, go build -tags debug).
-	memorydebug.Init(1024*1024*250, 1024*1024*150)
-
-	if !argNoKernelVersionCheck {
-		var major, minor, patch uint32
-		major, minor, patch, err = tracer.GetCurrentKernelVersion()
-		if err != nil {
-			msg := fmt.Sprintf("Failed to get kernel version: %v", err)
-			log.Error(msg)
-			return exitFailure
-		}
-
-		var minMajor, minMinor uint32
-		switch runtime.GOARCH {
-		case "amd64":
-			minMajor, minMinor = 4, 15
-		case "arm64":
-			// Older ARM64 kernel versions have broken bpf_probe_read.
-			// https://github.com/torvalds/linux/commit/6ae08ae3dea2cfa03dd3665a3c8475c2d429ef47
-			minMajor, minMinor = 5, 5
-		default:
-			msg := fmt.Sprintf("unsupported architecture: %s", runtime.GOARCH)
-			log.Error(msg)
-			return exitFailure
-		}
-
-		if major < minMajor || (major == minMajor && minor < minMinor) {
-			msg := fmt.Sprintf("Host Agent requires kernel version "+
-				"%d.%d or newer but got %d.%d.%d", minMajor, minMinor, major, minor, patch)
-			log.Error(msg)
-			return exitFailure
-		}
+	environment, err := platform.NewEnvironment(args.environmentType, args.machineID)
+	if err != nil {
+		log.Errorf("Failed to create environment: %v", err)
+		return exitFailure
 	}
 
 	if err = tracer.ProbeBPFSyscall(); err != nil {
-		msg := fmt.Sprintf("Failed to probe eBPF syscall: %v", err)
-		log.Error(msg)
-		return exitFailure
+		return failure(fmt.Sprintf("Failed to probe eBPF syscall: %v", err))
 	}
 
 	if err = tracer.ProbeTracepoint(); err != nil {
-		msg := fmt.Sprintf("Failed to probe tracepoint: %v", err)
-		log.Error(msg)
-		return exitFailure
+		return failure("Failed to probe tracepoint: %v", err)
 	}
 
-	validatedTags := hostmeta.ValidateTags(argTags)
-	log.Debugf("Validated tags: %s", validatedTags)
+	hostmeta.SetTags(args.tags)
 
 	var presentCores uint16
 	presentCores, err = hostmeta.PresentCPUCores()
 	if err != nil {
-		msg := fmt.Sprintf("Failed to read CPU file: %v", err)
-		log.Error(msg)
-		return exitFailure
+		return failure("Failed to read CPU file: %v", err)
 	}
 
 	// Retrieve host metadata that will be stored with the HA config, and
 	// sent to the backend with certain RPCs.
 	hostMetadataMap := make(map[string]string)
-	if err = hostmeta.AddMetadata(argCollAgentAddr, hostMetadataMap); err != nil {
-		msg := fmt.Sprintf("Unable to get host metadata for config: %v", err)
-		log.Error(msg)
+	if err = hostmeta.AddMetadata(args.collAgentAddr, hostMetadataMap); err != nil {
+		log.Errorf("Unable to get host metadata for config: %v", err)
 	}
 
 	// Metadata retrieval may fail, in which case, we initialize all values
@@ -218,56 +179,49 @@ func mainWithExitCode() exitCode {
 
 	log.Debugf("Reading the configuration")
 	conf := config.Config{
-		ProjectID:              uint32(argProjectID),
-		CacheDirectory:         argCacheDirectory,
-		EnvironmentType:        argEnvironmentType,
-		MachineID:              argMachineID,
-		SecretToken:            argSecretToken,
-		Tags:                   argTags,
-		ValidatedTags:          validatedTags,
-		Tracers:                argTracers,
-		Verbose:                argVerboseMode,
-		DisableTLS:             argDisableTLS,
-		NoKernelVersionCheck:   argNoKernelVersionCheck,
-		UploadSymbols:          false,
-		BpfVerifierLogLevel:    argBpfVerifierLogLevel,
-		BpfVerifierLogSize:     argBpfVerifierLogSize,
-		MonitorInterval:        argMonitorInterval,
-		ReportInterval:         argReporterInterval,
-		SamplesPerSecond:       uint16(argSamplesPerSecond),
-		CollectionAgentAddr:    argCollAgentAddr,
-		ConfigurationFile:      argConfigFile,
+		Version:                vc.Version(),
+		Revision:               vc.Revision(),
+		BuildTimestamp:         vc.BuildTimestamp(),
+		ProjectID:              uint32(args.projectID),
+		HostID:                 environment.HostID(),
+		CacheDirectory:         args.cacheDirectory,
+		SecretToken:            args.secretToken,
+		Tags:                   args.tags,
+		Tracers:                args.tracers,
+		Verbose:                args.verboseMode,
+		DisableTLS:             args.disableTLS,
+		NoKernelVersionCheck:   args.noKernelVersionCheck,
+		BpfVerifierLogLevel:    args.bpfVerifierLogLevel,
+		BpfVerifierLogSize:     args.bpfVerifierLogSize,
+		MonitorInterval:        args.monitorInterval,
+		ReportInterval:         args.reporterInterval,
+		SamplesPerSecond:       uint16(args.samplesPerSecond),
+		CollectionAgentAddr:    args.collAgentAddr,
+		ConfigurationFile:      args.configFile,
 		PresentCPUCores:        presentCores,
 		TraceCacheIntervals:    6,
-		MapScaleFactor:         uint8(argMapScaleFactor),
+		MapScaleFactor:         uint8(args.mapScaleFactor),
 		StartTime:              startTime,
 		IPAddress:              hostMetadataMap[hostmeta.KeyIPAddress],
 		Hostname:               hostMetadataMap[hostmeta.KeyHostname],
 		KernelVersion:          hostMetadataMap[hostmeta.KeyKernelVersion],
-		ProbabilisticInterval:  argProbabilisticInterval,
-		ProbabilisticThreshold: argProbabilisticThreshold,
+		ProbabilisticInterval:  args.probabilisticInterval,
+		ProbabilisticThreshold: args.probabilisticThreshold,
 	}
 	if err = config.SetConfiguration(&conf); err != nil {
-		msg := fmt.Sprintf("Failed to set configuration: %s", err)
-		log.Error(msg)
-		return exitFailure
+		return failure("Failed to set configuration: %v", err)
 	}
+
+	// Start periodic synchronization of monotonic clock
+	config.StartMonotonicSync(mainCtx)
 	log.Debugf("Done setting configuration")
 
 	times := config.GetTimes()
 
 	log.Debugf("Determining tracers to include")
-	includeTracers, err := parseTracers(argTracers)
+	includeTracers, err := config.ParseTracers(args.tracers)
 	if err != nil {
-		msg := fmt.Sprintf("Failed to parse the included tracers: %s", err)
-		log.Error(msg)
-		return exitFailure
-	}
-
-	if err = config.GenerateNewHostIDIfNecessary(); err != nil {
-		msg := fmt.Sprintf("Failed to generate new host ID: %s", err)
-		log.Error(msg)
-		return exitFailure
+		return failure("Failed to parse the included tracers: %s", err)
 	}
 
 	log.Infof("Assigned ProjectID: %d HostID: %d", config.ProjectID(), config.HostID())
@@ -275,14 +229,14 @@ func mainWithExitCode() exitCode {
 	// Scale the queues that report traces or information related to traces
 	// with the number of CPUs, the reporting interval and the sample frequencies.
 	tracesQSize := max(1024,
-		uint32(runtime.NumCPU()*int(argReporterInterval.Seconds()*2)*argSamplesPerSecond))
+		uint32(runtime.NumCPU()*int(args.reporterInterval.Seconds()*2)*args.samplesPerSecond))
 
-	metadataCollector := hostmetadata.NewCollector(argCollAgentAddr)
+	metadataCollector := hostmetadata.NewCollector(args.collAgentAddr, environment)
 
 	// TODO: Maybe abort execution if (some) metadata can not be collected
 	hostMetadataMap = metadataCollector.GetHostMetadata()
 
-	if bpfJITEnabled, found := hostMetadataMap["host:sysctl/net.core.bpf_jit_enable"]; found {
+	if bpfJITEnabled, found := hostMetadataMap["host.sysctl.net.core.bpf_jit_enable"]; found {
 		if bpfJITEnabled == "0" {
 			log.Warnf("The BPF JIT is disabled (net.core.bpf_jit_enable = 0). " +
 				"Enable it to reduce CPU overhead.")
@@ -292,24 +246,22 @@ func mainWithExitCode() exitCode {
 	// Network operations to CA start here
 	var rep reporter.Reporter
 	// Connect to the collection agent
-	rep, err = reporter.StartOTLP(mainCtx, &reporter.Config{
-		CollAgentAddr:           argCollAgentAddr,
+	rep, err = reporter.Start(mainCtx, &reporter.Config{
+		CollAgentAddr:           args.collAgentAddr,
 		MaxRPCMsgSize:           33554432, // 32 MiB
-		ExecMetadataMaxQueue:    1024,
+		ExecMetadataMaxQueue:    2048,
 		CountsForTracesMaxQueue: tracesQSize,
 		MetricsMaxQueue:         1024,
 		FramesForTracesMaxQueue: tracesQSize,
 		FrameMetadataMaxQueue:   tracesQSize,
 		HostMetadataMaxQueue:    2,
 		FallbackSymbolsMaxQueue: 1024,
-		DisableTLS:              argDisableTLS,
+		DisableTLS:              args.disableTLS,
 		MaxGRPCRetries:          5,
 		Times:                   times,
 	})
 	if err != nil {
-		msg := fmt.Sprintf("Failed to start reporting: %v", err)
-		log.Error(msg)
-		return exitFailure
+		return failure("Failed to start reporting: %v", err)
 	}
 
 	metrics.SetReporter(rep)
@@ -322,57 +274,46 @@ func mainWithExitCode() exitCode {
 	// Start agent specific metric retrieval and report them every second.
 	agentMetricCancel, agentErr := agentmetrics.Start(mainCtx, 1*time.Second)
 	if agentErr != nil {
-		msg := fmt.Sprintf("Error starting the agent specific "+
-			"metric collection: %s", agentErr)
-		log.Error(msg)
-		return exitFailure
+		return failure("Error starting the agent specific metric collection: %v", agentErr)
 	}
 	defer agentMetricCancel()
 	// Start reporter metric reporting with 60 second intervals.
 	defer reportermetrics.Start(mainCtx, rep, 60*time.Second)()
 
 	// Load the eBPF code and map definitions
-	trc, err := tracer.NewTracer(mainCtx, rep, times, includeTracers, !argSendErrorFrames)
+	trc, err := tracer.NewTracer(mainCtx, rep, times, includeTracers, !args.sendErrorFrames)
 	if err != nil {
-		msg := fmt.Sprintf("Failed to load eBPF tracer: %s", err)
-		log.Error(msg)
-		return exitFailure
+		return failure("Failed to load eBPF tracer: %v", err)
 	}
 	log.Printf("eBPF tracer loaded")
 	defer trc.Close()
 
 	now := time.Now()
 	// Initial scan of /proc filesystem to list currently-active PIDs and have them processed.
-	if err := trc.StartPIDEventProcessor(mainCtx); err != nil {
+	if err = trc.StartPIDEventProcessor(mainCtx); err != nil {
 		log.Errorf("Failed to list processes from /proc: %v", err)
 	}
 	metrics.Add(metrics.IDProcPIDStartupMs, metrics.MetricValue(time.Since(now).Milliseconds()))
 	log.Debug("Completed initial PID listing")
 
 	// Attach our tracer to the perf event
-	if err := trc.AttachTracer(argSamplesPerSecond); err != nil {
-		msg := fmt.Sprintf("Failed to attach to perf event: %v", err)
-		log.Error(msg)
-		return exitFailure
+	if err := trc.AttachTracer(args.samplesPerSecond); err != nil {
+		return failure("Failed to attach to perf event: %v", err)
 	}
 	log.Info("Attached tracer program")
 
-	if argProbabilisticThreshold < tracer.ProbabilisticThresholdMax {
+	if args.probabilisticThreshold < tracer.ProbabilisticThresholdMax {
 		trc.StartProbabilisticProfiling(mainCtx,
-			argProbabilisticInterval, argProbabilisticThreshold)
+			args.probabilisticInterval, args.probabilisticThreshold)
 		log.Printf("Enabled probabilistic profiling")
 	} else {
 		if err := trc.EnableProfiling(); err != nil {
-			msg := fmt.Sprintf("Failed to enable perf events: %v", err)
-			log.Error(msg)
-			return exitFailure
+			return failure("Failed to enable perf events: %v", err)
 		}
 	}
 
 	if err := trc.AttachSchedMonitor(); err != nil {
-		msg := fmt.Sprintf("Failed to attach scheduler monitor: %v", err)
-		log.Error(msg)
-		return exitFailure
+		return failure("Failed to attach scheduler monitor: %v", err)
 	}
 
 	// This log line is used in our system tests to verify if that the agent has started. So if you
@@ -380,9 +321,7 @@ func mainWithExitCode() exitCode {
 	log.Printf("Attached sched monitor")
 
 	if err := startTraceHandling(mainCtx, rep, times, trc); err != nil {
-		msg := fmt.Sprintf("Failed to start trace handling: %v", err)
-		log.Error(msg)
-		return exitFailure
+		return failure("Failed to start trace handling: %v", err)
 	}
 
 	// Block waiting for a signal to indicate the program should terminate
@@ -393,4 +332,66 @@ func mainWithExitCode() exitCode {
 
 	log.Info("Exiting ...")
 	return exitSuccess
+}
+
+func sanityCheck(args *arguments) exitCode {
+	if args.environmentType == "" && args.machineID != "" {
+		return parseError("You can only specify the machine ID if you also provide the environment")
+	}
+
+	if args.mapScaleFactor > 8 {
+		return parseError("eBPF map scaling factor %d exceeds limit (max: %d)",
+			args.mapScaleFactor, maxArgMapScaleFactor)
+	}
+
+	if args.bpfVerifierLogLevel > 2 {
+		return parseError("Invalid eBPF verifier log level: %d", args.bpfVerifierLogLevel)
+	}
+
+	if args.probabilisticInterval < 1*time.Minute || args.probabilisticInterval > 5*time.Minute {
+		return parseError("Invalid argument for probabilistic-interval: use " +
+			"a duration between 1 and 5 minutes")
+	}
+
+	if args.probabilisticThreshold < 1 ||
+		args.probabilisticThreshold > tracer.ProbabilisticThresholdMax {
+		return parseError("Invalid argument for probabilistic-threshold. Value "+
+			"should be between 1 and %d", tracer.ProbabilisticThresholdMax)
+	}
+
+	if !args.noKernelVersionCheck {
+		major, minor, patch, err := tracer.GetCurrentKernelVersion()
+		if err != nil {
+			return failure("Failed to get kernel version: %v", err)
+		}
+
+		var minMajor, minMinor uint32
+		switch runtime.GOARCH {
+		case "amd64":
+			minMajor, minMinor = 4, 15
+		case "arm64":
+			// Older ARM64 kernel versions have broken bpf_probe_read.
+			// https://github.com/torvalds/linux/commit/6ae08ae3dea2cfa03dd3665a3c8475c2d429ef47
+			minMajor, minMinor = 5, 5
+		default:
+			return failure("Unsupported architecture: %s", runtime.GOARCH)
+		}
+
+		if major < minMajor || (major == minMajor && minor < minMinor) {
+			return failure("Host Agent requires kernel version "+
+				"%d.%d or newer but got %d.%d.%d", minMajor, minMinor, major, minor, patch)
+		}
+	}
+
+	return exitSuccess
+}
+
+func parseError(msg string, args ...interface{}) exitCode {
+	log.Errorf(msg, args...)
+	return exitParseError
+}
+
+func failure(msg string, args ...interface{}) exitCode {
+	log.Errorf(msg, args...)
+	return exitFailure
 }

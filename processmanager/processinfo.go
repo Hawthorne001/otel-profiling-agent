@@ -23,25 +23,23 @@ import (
 	"syscall"
 	"time"
 
-	"golang.org/x/sys/unix"
+	log "github.com/sirupsen/logrus"
 
 	"github.com/elastic/otel-profiling-agent/host"
 	"github.com/elastic/otel-profiling-agent/interpreter"
 	"github.com/elastic/otel-profiling-agent/libpf"
-	"github.com/elastic/otel-profiling-agent/libpf/memorydebug"
 	"github.com/elastic/otel-profiling-agent/libpf/pfelf"
-	"github.com/elastic/otel-profiling-agent/libpf/process"
 	"github.com/elastic/otel-profiling-agent/lpm"
 	"github.com/elastic/otel-profiling-agent/proc"
+	"github.com/elastic/otel-profiling-agent/process"
 	eim "github.com/elastic/otel-profiling-agent/processmanager/execinfomanager"
 	"github.com/elastic/otel-profiling-agent/tpbase"
-
-	log "github.com/sirupsen/logrus"
+	"github.com/elastic/otel-profiling-agent/util"
 )
 
 // assignTSDInfo updates the TSDInfo for the Interpreters on given PID.
 // Caller must hold pm.mu write lock.
-func (pm *ProcessManager) assignTSDInfo(pid libpf.PID, tsdInfo *tpbase.TSDInfo) {
+func (pm *ProcessManager) assignTSDInfo(pid util.PID, tsdInfo *tpbase.TSDInfo) {
 	if tsdInfo == nil {
 		return
 	}
@@ -68,7 +66,7 @@ func (pm *ProcessManager) assignTSDInfo(pid libpf.PID, tsdInfo *tpbase.TSDInfo) 
 
 // getTSDInfo retrieves the TSDInfo of given PID
 // Caller must hold pm.mu read lock.
-func (pm *ProcessManager) getTSDInfo(pid libpf.PID) *tpbase.TSDInfo {
+func (pm *ProcessManager) getTSDInfo(pid util.PID) *tpbase.TSDInfo {
 	if info, ok := pm.pidToProcessInfo[pid]; ok {
 		return info.tsdInfo
 	}
@@ -81,14 +79,15 @@ func (pm *ProcessManager) getTSDInfo(pid libpf.PID) *tpbase.TSDInfo {
 // already exists, it returns true. Otherwise false or an error.
 //
 // Caller must hold pm.mu write lock.
-func (pm *ProcessManager) updatePidInformation(pid libpf.PID, m *Mapping) (bool, error) {
+func (pm *ProcessManager) updatePidInformation(pid util.PID, m *Mapping) (bool, error) {
 	info, ok := pm.pidToProcessInfo[pid]
 	if !ok {
 		// We don't have information for this pid, so we first need to
 		// allocate the embedded map for this process.
 		info = &processInfo{
-			mappings: make(map[libpf.Address]Mapping),
-			tsdInfo:  nil,
+			mappings:         make(map[libpf.Address]*Mapping),
+			mappingsByFileID: make(map[host.FileID]map[libpf.Address]*Mapping),
+			tsdInfo:          nil,
 		}
 		pm.pidToProcessInfo[pid] = info
 
@@ -101,13 +100,13 @@ func (pm *ProcessManager) updatePidInformation(pid libpf.PID, m *Mapping) (bool,
 		}
 		pm.pidPageToMappingInfoSize++
 	} else if mf, ok := info.mappings[m.Vaddr]; ok {
-		if *m == mf {
+		if *m == *mf {
 			// We try to update our information about a particular mapping we already know about.
 			return true, nil
 		}
 	}
 
-	info.mappings[m.Vaddr] = *m
+	info.addMapping(*m)
 
 	prefixes, err := lpm.CalculatePrefixList(uint64(m.Vaddr), uint64(m.Vaddr)+m.Length)
 	if err != nil {
@@ -133,7 +132,7 @@ func (pm *ProcessManager) updatePidInformation(pid libpf.PID, m *Mapping) (bool,
 // deletePIDAddress removes the mapping at addr from pid from the internal structure of the
 // process manager instance as well as from the eBPF maps.
 // Caller must hold pm.mu write lock.
-func (pm *ProcessManager) deletePIDAddress(pid libpf.PID, addr libpf.Address) error {
+func (pm *ProcessManager) deletePIDAddress(pid util.PID, addr libpf.Address) error {
 	info, ok := pm.pidToProcessInfo[pid]
 	if !ok {
 		return fmt.Errorf("unknown PID %d: %w", pid, errUnknownPID)
@@ -156,18 +155,18 @@ func (pm *ProcessManager) deletePIDAddress(pid libpf.PID, addr libpf.Address) er
 	}
 
 	pm.pidPageToMappingInfoSize -= uint64(deleted)
-	delete(info.mappings, addr)
+	info.removeMapping(mapping)
 
 	return pm.eim.RemoveOrDecRef(mapping.FileID)
 }
 
 // assignInterpreter will update the interpreters maps with given interpreter.Instance.
-func (pm *ProcessManager) assignInterpreter(pid libpf.PID, key libpf.OnDiskFileIdentifier,
+func (pm *ProcessManager) assignInterpreter(pid util.PID, key util.OnDiskFileIdentifier,
 	instance interpreter.Instance) {
 	if _, ok := pm.interpreters[pid]; !ok {
 		// This is the very first interpreter entry for this process.
 		// So we need to initialize the structure first.
-		pm.interpreters[pid] = make(map[libpf.OnDiskFileIdentifier]interpreter.Instance)
+		pm.interpreters[pid] = make(map[util.OnDiskFileIdentifier]interpreter.Instance)
 	}
 	pm.interpreters[pid][key] = instance
 }
@@ -247,19 +246,8 @@ func (pm *ProcessManager) handleNewMapping(pr process.Process, m *Mapping,
 
 func (pm *ProcessManager) getELFInfo(pr process.Process, mapping *process.Mapping,
 	elfRef *pfelf.Reference) elfInfo {
-	var lastModified int64
-
-	mappingFile := pr.GetMappingFile(mapping)
-	if mappingFile != "" {
-		var st unix.Stat_t
-		if err := unix.Stat(mappingFile, &st); err != nil {
-			return elfInfo{err: err}
-		}
-		lastModified = st.Mtim.Nano()
-	}
-
 	key := mapping.GetOnDiskFileIdentifier()
-
+	lastModified := pr.GetMappingFileLastModified(mapping)
 	if info, ok := pm.elfInfoCache.Get(key); ok && info.lastModified == lastModified {
 		// Cached data ok
 		pm.elfInfoCacheHit.Add(1)
@@ -290,7 +278,7 @@ func (pm *ProcessManager) getELFInfo(pr process.Process, mapping *process.Mappin
 		return info
 	}
 
-	hostFileID := host.CalculateKernelFileID(fileID)
+	hostFileID := host.FileIDFromLibpf(fileID)
 	info.fileID = hostFileID
 	info.addressMapper = ef.GetAddressMapper()
 	if mapping.IsVDSO() {
@@ -313,7 +301,11 @@ func (pm *ProcessManager) getELFInfo(pr process.Process, mapping *process.Mappin
 	}
 
 	buildID, _ := ef.GetBuildID()
-	pm.reporter.ExecutableMetadata(context.TODO(), fileID, baseName, buildID)
+	mapping2 := *mapping // copy to avoid races if callee saves the closure
+	open := func() (process.ReadAtCloser, error) {
+		return pr.OpenMappingFile(&mapping2)
+	}
+	pm.reporter.ExecutableMetadata(context.TODO(), fileID, baseName, buildID, libpf.Native, open)
 
 	return info
 }
@@ -359,15 +351,19 @@ func (pm *ProcessManager) processNewExecMapping(pr process.Process, mapping *pro
 			Inode:      mapping.Inode,
 			FileOffset: mapping.FileOffset,
 		}, elfRef); err != nil {
-		log.Errorf("Failed to handle mapping for PID %d, file %s: %v",
-			pr.PID(), mapping.Path, err)
+		// Same as above, ignore the errors related to process having exited.
+		// Also ignore errors of deferred file IDs.
+		if !errors.Is(err, os.ErrNotExist) && !errors.Is(err, eim.ErrDeferredFileID) {
+			log.Errorf("Failed to handle mapping for PID %d, file %s: %v",
+				pr.PID(), mapping.Path, err)
+		}
 	}
 }
 
 // processRemovedMappings removes listed memory mappings and loaded interpreters from
 // the internal structures and eBPF maps.
-func (pm *ProcessManager) processRemovedMappings(pid libpf.PID, mappings []libpf.Address,
-	interpretersValid libpf.Set[libpf.OnDiskFileIdentifier]) {
+func (pm *ProcessManager) processRemovedMappings(pid util.PID, mappings []libpf.Address,
+	interpretersValid libpf.Set[util.OnDiskFileIdentifier]) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
@@ -423,7 +419,7 @@ func (pm *ProcessManager) synchronizeMappings(pr process.Process,
 	mpAdd := make(map[libpf.Address]*process.Mapping, len(mappings))
 	mpRemove := make([]libpf.Address, 0)
 
-	interpretersValid := make(libpf.Set[libpf.OnDiskFileIdentifier])
+	interpretersValid := make(libpf.Set[util.OnDiskFileIdentifier])
 	for idx := range mappings {
 		m := &mappings[idx]
 		if !m.IsExecutable() || m.IsAnonymous() {
@@ -463,8 +459,6 @@ func (pm *ProcessManager) synchronizeMappings(pr process.Process,
 
 	// Add the new ELF mappings
 	for _, mapping := range mpAdd {
-		// Output memory usage in debug builds.
-		memorydebug.DebugLogMemoryUsage()
 		pm.processNewExecMapping(pr, mapping)
 	}
 
@@ -497,8 +491,8 @@ func (pm *ProcessManager) synchronizeMappings(pr process.Process,
 // is stored for later processing in SymbolizationComplete when all traces have been collected.
 // There can be a race condition if we can not clean up the references for this process
 // fast enough and this particular pid is reused again by the system.
-// NOTE: Exported only for tracer/.
-func (pm *ProcessManager) ProcessPIDExit(pid libpf.PID) bool {
+// NOTE: Exported only for tracer.
+func (pm *ProcessManager) ProcessPIDExit(pid util.PID) bool {
 	log.Debugf("- PID: %v", pid)
 	defer pm.ebpf.RemoveReportedPID(pid)
 
@@ -506,7 +500,7 @@ func (pm *ProcessManager) ProcessPIDExit(pid libpf.PID) bool {
 	defer pm.mu.Unlock()
 
 	symbolize := false
-	exitKTime := libpf.GetKTime()
+	exitKTime := util.GetKTime()
 	if pm.interpreterTracerEnabled {
 		if len(pm.interpreters[pid]) > 0 {
 			pm.exitEvents[pid] = exitKTime
@@ -590,7 +584,7 @@ func (pm *ProcessManager) SynchronizeProcess(pr process.Process) {
 		return
 	}
 
-	libpf.AtomicUpdateMaxUint32(&pm.mappingStats.maxProcParseUsec, uint32(elapsed.Microseconds()))
+	util.AtomicUpdateMaxUint32(&pm.mappingStats.maxProcParseUsec, uint32(elapsed.Microseconds()))
 	pm.mappingStats.totalProcParseUsec.Add(uint32(elapsed.Microseconds()))
 
 	if pm.synchronizeMappings(pr, mappings) {
@@ -611,9 +605,9 @@ func (pm *ProcessManager) SynchronizeProcess(pr process.Process) {
 }
 
 // CleanupPIDs executes a periodic synchronization of pidToProcessInfo table with system processes.
-// NOTE: Exported only for tracer/.
+// NOTE: Exported only for tracer.
 func (pm *ProcessManager) CleanupPIDs() {
-	deadPids := make([]libpf.PID, 0, 16)
+	deadPids := make([]util.PID, 0, 16)
 
 	pm.mu.RLock()
 	for pid := range pm.pidToProcessInfo {

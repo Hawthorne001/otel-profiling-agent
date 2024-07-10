@@ -10,22 +10,10 @@ import (
 	"context"
 	"time"
 
-	"github.com/elastic/otel-profiling-agent/config"
 	"github.com/elastic/otel-profiling-agent/libpf"
+	"github.com/elastic/otel-profiling-agent/process"
+	"github.com/elastic/otel-profiling-agent/util"
 )
-
-// Compile time check to make sure config.Times satisfies the interfaces.
-var _ Times = (*config.Times)(nil)
-
-// Times is a subset of config.IntervalsAndTimers.
-type Times interface {
-	ReportInterval() time.Duration
-	ReportMetricsInterval() time.Duration
-	GRPCConnectionTimeout() time.Duration
-	GRPCOperationTimeout() time.Duration
-	GRPCStartupBackoffTime() time.Duration
-	GRPCAuthErrorDelay() time.Duration
-}
 
 // Reporter is the top-level interface implemented by a full reporter.
 type Reporter interface {
@@ -47,9 +35,21 @@ type TraceReporter interface {
 
 	// ReportCountForTrace accepts a hash of a trace with a corresponding count and
 	// caches this information before a periodic reporting to the backend.
-	ReportCountForTrace(traceHash libpf.TraceHash, timestamp libpf.UnixTime32,
-		count uint16, comm, podName, containerName string)
+	ReportCountForTrace(traceHash libpf.TraceHash, timestamp libpf.UnixTime64,
+		count uint16, comm, podName, containerName, apmServiceName string)
+
+	// ReportTraceEvent accepts a trace event (trace metadata with frames and counts)
+	// and caches it for reporting to the backend. It returns true if the event was
+	// enqueued for reporting, and false if the event was ignored.
+	ReportTraceEvent(trace *libpf.Trace, timestamp libpf.UnixTime64,
+		comm, podName, containerName, apmServiceName string)
+
+	// SupportsReportTraceEvent returns true if the reporter supports reporting trace events
+	// via ReportTraceEvent().
+	SupportsReportTraceEvent() bool
 }
+
+type ExecutableOpener = func() (process.ReadAtCloser, error)
 
 type SymbolReporter interface {
 	// ReportFallbackSymbol enqueues a fallback symbol for reporting, for a given frame.
@@ -57,12 +57,18 @@ type SymbolReporter interface {
 
 	// ExecutableMetadata accepts a fileID with the corresponding filename
 	// and caches this information before a periodic reporting to the backend.
-	ExecutableMetadata(ctx context.Context, fileID libpf.FileID, fileName, buildID string)
+	//
+	// The `open` argument can be used to open the executable for reading. Interpreters
+	// that don't support this may pass a `nil` function pointer. Implementations that
+	// wish to upload executables should NOT block this function to do so and instead just
+	// open the file and then enqueue the upload in the background.
+	ExecutableMetadata(ctx context.Context, fileID libpf.FileID, fileName, buildID string,
+		interp libpf.InterpreterType, open ExecutableOpener)
 
 	// FrameMetadata accepts metadata associated with a frame and caches this information before
 	// a periodic reporting to the backend.
 	FrameMetadata(fileID libpf.FileID, addressOrLine libpf.AddressOrLineno,
-		lineNumber libpf.SourceLineno, functionOffset uint32, functionName, filePath string)
+		lineNumber util.SourceLineno, functionOffset uint32, functionName, filePath string)
 }
 
 type HostMetadataReporter interface {

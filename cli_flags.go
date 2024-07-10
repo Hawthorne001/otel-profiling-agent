@@ -10,29 +10,26 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"runtime"
-	"strings"
 	"time"
 
 	cebpf "github.com/cilium/ebpf"
 	"github.com/peterbourgon/ff/v3"
+	log "github.com/sirupsen/logrus"
 
-	"github.com/elastic/otel-profiling-agent/config"
-	"github.com/elastic/otel-profiling-agent/debug/log"
 	"github.com/elastic/otel-profiling-agent/hostmetadata/host"
 	"github.com/elastic/otel-profiling-agent/tracer"
 )
 
 const (
 	// Default values for CLI flags
-	defaultArgSamplesPerSecond       = 20
-	defaultArgReporterInterval       = 5.0 * time.Second
-	defaultArgMonitorInterval        = 5.0 * time.Second
-	defaultArgPrivateMachineID       = ""
-	defaultArgPrivateEnvironmentType = ""
-	defaultProbabilisticThreshold    = tracer.ProbabilisticThresholdMax
-	defaultProbabilisticInterval     = 1 * time.Minute
-	defaultArgSendErrorFrames        = false
+	defaultArgSamplesPerSecond    = 20
+	defaultArgReporterInterval    = 5.0 * time.Second
+	defaultArgMonitorInterval     = 5.0 * time.Second
+	defaultArgMachineID           = ""
+	defaultArgEnvironmentType     = ""
+	defaultProbabilisticThreshold = tracer.ProbabilisticThresholdMax
+	defaultProbabilisticInterval  = 1 * time.Minute
+	defaultArgSendErrorFrames     = false
 
 	// This is the X in 2^(n + x) where n is the default hardcoded map size value
 	defaultArgMapScaleFactor = 0
@@ -55,10 +52,10 @@ var (
 	configFileHelp = "Path to the profiling agent configuration file."
 	projectIDHelp  = "The project ID to split profiling data into logical groups. " +
 		"Its value should be larger than 0 and smaller than 4096."
-	cacheDirectoryHelp = "The directory where profiling agent can store cached data."
+	cacheDirectoryHelp = "The directory where the profiling agent can store cached data."
 	secretTokenHelp    = "The secret token associated with the project id."
 	tagsHelp           = fmt.Sprintf("User-specified tags separated by ';'. "+
-		"Each tag should match '%v'.", host.ValidTagRegex)
+		"Each tag should match '%v'.", host.ValidTagRegex())
 	disableTLSHelp          = "Disable encryption for data in transit."
 	bpfVerifierLogLevelHelp = "Log level of the eBPF verifier output (0,1,2). Default is 0."
 	bpfVerifierLogSizeHelp  = "Size in bytes that will be allocated for the eBPF " +
@@ -73,88 +70,124 @@ var (
 		tracer.ProbabilisticThresholdMax-1, tracer.ProbabilisticThresholdMax-1)
 	probabilisticIntervalHelp = "Time interval for which probabilistic profiling will be " +
 		"enabled or disabled."
+	pprofHelp            = "Listening address (e.g. localhost:6060) to serve pprof information."
+	samplesPerSecondHelp = "Set the frequency (in Hz) of stack trace sampling."
+	reporterIntervalHelp = "Set the reporter's interval in seconds."
+	monitorIntervalHelp  = "Set the monitor interval in seconds."
+	environmentTypeHelp  = "The type of environment."
+	machineIDHelp        = "The machine ID."
+	enablePProfHelp      = "Enables PProf profiling"
+	saveCPUProfileHelp   = "Save CPU pprof profile to `cpu.pprof`"
+	sendErrorFramesHelp  = "Send error frames (devfiler only, breaks Kibana)"
 )
 
-// Variables for command line arguments
-var (
-	// Customer-visible flag variables.
-	argNoKernelVersionCheck   bool
-	argCollAgentAddr          string
-	argCopyright              bool
-	argVersion                bool
-	argTracers                string
-	argVerboseMode            bool
-	argProjectID              uint
-	argCacheDirectory         string
-	argConfigFile             string
-	argSecretToken            string
-	argDisableTLS             bool
-	argTags                   string
-	argBpfVerifierLogLevel    uint
-	argBpfVerifierLogSize     int
-	argMapScaleFactor         uint
-	argProbabilisticThreshold uint
-	argProbabilisticInterval  time.Duration
+type arguments struct {
+	bpfVerifierLogLevel    uint
+	bpfVerifierLogSize     int
+	cacheDirectory         string
+	collAgentAddr          string
+	configFile             string
+	copyright              bool
+	disableTLS             bool
+	enablePProf            bool
+	environmentType        string
+	machineID              string
+	mapScaleFactor         uint
+	monitorInterval        time.Duration
+	noKernelVersionCheck   bool
+	pprofAddr              string
+	probabilisticInterval  time.Duration
+	probabilisticThreshold uint
+	projectID              uint
+	reporterInterval       time.Duration
+	samplesPerSecond       int
+	saveCPUProfile         bool
+	secretToken            string
+	sendErrorFrames        bool
+	tags                   string
+	tracers                string
+	verboseMode            bool
+	version                bool
 
-	// "internal" flag variables.
-	// Flag variables that are configured in "internal" builds will have to be assigned
-	// a default value here, for their consumption in customer-facing builds.
-	argEnvironmentType  = defaultArgPrivateEnvironmentType
-	argMachineID        = defaultArgPrivateMachineID
-	argMonitorInterval  = defaultArgMonitorInterval
-	argReporterInterval = defaultArgReporterInterval
-	argSamplesPerSecond = defaultArgSamplesPerSecond
-	argSendErrorFrames  = defaultArgSendErrorFrames
-)
+	fs *flag.FlagSet
+}
 
 // Package-scope variable, so that conditionally compiled other components can refer
 // to the same flagset.
-var fs = flag.NewFlagSet("otel-profiling-agent", flag.ExitOnError)
 
-func parseArgs() error {
+func parseArgs() (*arguments, error) {
+	var args arguments
+
+	fs := flag.NewFlagSet("otel-profiling-agent", flag.ExitOnError)
+
 	// Please keep the parameters ordered alphabetically in the source-code.
-	fs.UintVar(&argBpfVerifierLogLevel, "bpf-log-level", 0, bpfVerifierLogLevelHelp)
-	fs.IntVar(&argBpfVerifierLogSize, "bpf-log-size", cebpf.DefaultVerifierLogSize,
+	fs.UintVar(&args.bpfVerifierLogLevel, "bpf-log-level", 0, bpfVerifierLogLevelHelp)
+	fs.IntVar(&args.bpfVerifierLogSize, "bpf-log-size", cebpf.DefaultVerifierLogSize,
 		bpfVerifierLogSizeHelp)
 
-	fs.StringVar(&argCacheDirectory, "cache-directory", config.CacheDirectory(),
+	fs.StringVar(&args.cacheDirectory, "cache-directory", "/var/cache/otel/profiling-agent",
 		cacheDirectoryHelp)
-	fs.StringVar(&argCollAgentAddr, "collection-agent", "",
-		collAgentAddrHelp)
-	fs.StringVar(&argConfigFile, "config", "/etc/otel/profiling-agent/agent.conf",
+	fs.StringVar(&args.collAgentAddr, "collection-agent", "", collAgentAddrHelp)
+	fs.StringVar(&args.configFile, "config", "/etc/otel/profiling-agent/agent.conf",
 		configFileHelp)
-	fs.BoolVar(&argCopyright, "copyright", false, copyrightHelp)
+	fs.BoolVar(&args.copyright, "copyright", false, copyrightHelp)
 
-	fs.BoolVar(&argDisableTLS, "disable-tls", false, disableTLSHelp)
+	fs.BoolVar(&args.disableTLS, "disable-tls", false, disableTLSHelp)
 
-	fs.UintVar(&argMapScaleFactor, "map-scale-factor",
+	fs.BoolVar(&args.enablePProf, "enable-pprof", false, enablePProfHelp)
+
+	fs.StringVar(&args.environmentType, "environment-type", defaultArgEnvironmentType,
+		environmentTypeHelp)
+
+	fs.StringVar(&args.machineID, "machine-id", defaultArgMachineID, machineIDHelp)
+
+	fs.UintVar(&args.mapScaleFactor, "map-scale-factor",
 		defaultArgMapScaleFactor, mapScaleFactorHelp)
 
-	fs.BoolVar(&argNoKernelVersionCheck, "no-kernel-version-check", false, noKernelVersionCheckHelp)
+	fs.DurationVar(&args.monitorInterval, "monitor-interval", defaultArgMonitorInterval,
+		monitorIntervalHelp)
 
-	fs.UintVar(&argProjectID, "project-id", 1, projectIDHelp)
+	fs.BoolVar(&args.noKernelVersionCheck, "no-kernel-version-check", false,
+		noKernelVersionCheckHelp)
+
+	fs.UintVar(&args.projectID, "project-id", 1, projectIDHelp)
+
+	fs.StringVar(&args.pprofAddr, "pprof", "", pprofHelp)
+
+	fs.DurationVar(&args.probabilisticInterval, "probabilistic-interval",
+		defaultProbabilisticInterval, probabilisticIntervalHelp)
+	fs.UintVar(&args.probabilisticThreshold, "probabilistic-threshold",
+		defaultProbabilisticThreshold, probabilisticThresholdHelp)
+
+	fs.DurationVar(&args.reporterInterval, "reporter-interval", defaultArgReporterInterval,
+		reporterIntervalHelp)
+
+	fs.IntVar(&args.samplesPerSecond, "samples-per-second", defaultArgSamplesPerSecond,
+		samplesPerSecondHelp)
+
+	fs.BoolVar(&args.saveCPUProfile, "save-cpuprofile", false, saveCPUProfileHelp)
 
 	// Using a default value here to simplify OTEL review process.
-	fs.StringVar(&argSecretToken, "secret-token", "abc123", secretTokenHelp)
+	fs.StringVar(&args.secretToken, "secret-token", "abc123", secretTokenHelp)
 
-	fs.StringVar(&argTags, "tags", "", tagsHelp)
-	fs.StringVar(&argTracers, "t", "all", "Shorthand for -tracers.")
-	fs.StringVar(&argTracers, "tracers", "all", tracersHelp)
+	fs.BoolVar(&args.sendErrorFrames, "send-error-frames", defaultArgSendErrorFrames,
+		sendErrorFramesHelp)
 
-	fs.BoolVar(&argVerboseMode, "v", false, "Shorthand for -verbose.")
-	fs.BoolVar(&argVerboseMode, "verbose", false, verboseModeHelp)
-	fs.BoolVar(&argVersion, "version", false, versionHelp)
+	fs.StringVar(&args.tags, "tags", "", tagsHelp)
+	fs.StringVar(&args.tracers, "t", "all", "Shorthand for -tracers.")
+	fs.StringVar(&args.tracers, "tracers", "all", tracersHelp)
 
-	fs.UintVar(&argProbabilisticThreshold, "probabilistic-threshold",
-		defaultProbabilisticThreshold, probabilisticThresholdHelp)
-	fs.DurationVar(&argProbabilisticInterval, "probabilistic-interval",
-		defaultProbabilisticInterval, probabilisticIntervalHelp)
+	fs.BoolVar(&args.verboseMode, "v", false, "Shorthand for -verbose.")
+	fs.BoolVar(&args.verboseMode, "verbose", false, verboseModeHelp)
+	fs.BoolVar(&args.version, "version", false, versionHelp)
 
 	fs.Usage = func() {
 		fs.PrintDefaults()
 	}
 
-	err := ff.Parse(fs, os.Args[1:],
+	args.fs = fs
+
+	return &args, ff.Parse(fs, os.Args[1:],
 		ff.WithEnvVarPrefix("OTEL_PROFILING_AGENT"),
 		ff.WithConfigFileFlag("config"),
 		ff.WithConfigFileParser(ff.PlainParser),
@@ -163,79 +196,11 @@ func parseArgs() error {
 		ff.WithIgnoreUndefined(true),
 		ff.WithAllowMissingConfigFile(true),
 	)
-
-	return err
 }
 
-// parseTracers parses a string that specifies one or more eBPF tracers to enable.
-// Valid inputs are 'all', 'native', 'python', 'php', or any comma-delimited combination of these.
-// The return value is a boolean lookup table that represents the input strings.
-// E.g. to check if the Python tracer was requested: `if result[config.PythonTracer]...`.
-func parseTracers(tracers string) ([]bool, error) {
-	fields := strings.Split(tracers, ",")
-	if len(fields) == 0 {
-		return nil, fmt.Errorf("invalid tracer specification '%s'", tracers)
-	}
-
-	result := make([]bool, config.MaxTracers)
-	tracerNameToType := map[string]config.TracerType{
-		"v8":      config.V8Tracer,
-		"php":     config.PHPTracer,
-		"perl":    config.PerlTracer,
-		"ruby":    config.RubyTracer,
-		"python":  config.PythonTracer,
-		"hotspot": config.HotspotTracer,
-	}
-
-	// Parse and validate tracers string
-	for _, name := range fields {
-		name = strings.ToLower(name)
-
-		//nolint:goconst
-		if runtime.GOARCH == "arm64" && name == "v8" {
-			return nil, fmt.Errorf("the V8 tracer is currently not supported on ARM64")
-		}
-
-		if tracerType, ok := tracerNameToType[name]; ok {
-			result[tracerType] = true
-			continue
-		}
-
-		if name == "all" {
-			for i := range result {
-				result[i] = true
-			}
-			result[config.V8Tracer] = runtime.GOARCH != "arm64" //nolint:goconst
-			continue
-		}
-		if name == "native" {
-			log.Warn("Enabling the `native` tracer explicitly is deprecated (it's now always-on)")
-			continue
-		}
-
-		if name != "" {
-			return nil, fmt.Errorf("unknown tracer: %s", name)
-		}
-	}
-
-	tracersEnabled := make([]string, 0, config.MaxTracers)
-	for _, tracerType := range config.AllTracers() {
-		if result[tracerType] {
-			tracersEnabled = append(tracersEnabled, tracerType.GetString())
-		}
-	}
-
-	if len(tracersEnabled) > 0 {
-		log.Debugf("Tracer string: %v", tracers)
-		log.Infof("Interpreter tracers: %v", strings.Join(tracersEnabled, ","))
-	}
-
-	return result, nil
-}
-
-func dumpArgs() {
+func (args *arguments) dump() {
 	log.Debug("Config:")
-	fs.VisitAll(func(f *flag.Flag) {
+	args.fs.VisitAll(func(f *flag.Flag) {
 		log.Debug(fmt.Sprintf("%s: %v", f.Name, f.Value))
 	})
 }

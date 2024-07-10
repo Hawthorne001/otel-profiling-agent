@@ -11,12 +11,13 @@ package tpbase
 import (
 	"bytes"
 	"encoding/binary"
-	"fmt"
+	"errors"
 	"unsafe"
+
+	_ "github.com/elastic/otel-profiling-agent/zydis" // links Zydis
 )
 
 // #cgo CFLAGS: -g -Wall
-// #cgo LDFLAGS: -lZydis
 // #include <stdlib.h>
 // #include "fsbase_decode_amd64.h"
 import "C"
@@ -36,7 +37,7 @@ func GetAnalyzers() []Analyzer {
 // kernel in order to compute the offset of `fsbase` into `task_struct`.
 func AnalyzeAoutDumpDebugregs(code []byte) (uint32, error) {
 	if len(code) == 0 {
-		return 0, fmt.Errorf("empty code blob passed to getFSBaseOffset")
+		return 0, errors.New("empty code blob passed to getFSBaseOffset")
 	}
 
 	// Because different compilers generate code that looks different enough, we disassemble the
@@ -46,7 +47,7 @@ func AnalyzeAoutDumpDebugregs(code []byte) (uint32, error) {
 		(*C.uint8_t)(unsafe.Pointer(&code[0])), C.size_t(len(code))))
 
 	if offset == 0 {
-		return 0, fmt.Errorf("unable to determine fsbase offset")
+		return 0, errors.New("unable to determine fsbase offset")
 	}
 
 	return offset, nil
@@ -70,7 +71,7 @@ func AnalyzeX86fsbaseWriteTask(code []byte) (uint32, error) {
 	// See https://elixir.bootlin.com/linux/latest/source/arch/x86/kernel/process_64.c#L466
 	idx := bytes.Index(code, []byte{0x48, 0x89, 0xb7})
 	if idx == -1 || idx+7 > len(code) {
-		return 0, fmt.Errorf("unexpected x86_fsbase_write_task (mov not found)")
+		return 0, errors.New("unexpected x86_fsbase_write_task (mov not found)")
 	}
 	offset := binary.LittleEndian.Uint32(code[idx+3:])
 	return offset, nil

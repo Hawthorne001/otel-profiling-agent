@@ -11,7 +11,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/google/go-cmp/cmp"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // nolint:lll
@@ -126,28 +127,31 @@ const fakeAzureAnswer = `{
 }`
 
 var expectedResult = map[string]string{
-	"azure:compute/environment":    "AzurePublicCloud",
-	"azure:compute/location":       "westeurope",
-	"azure:compute/name":           "bar-test",
-	"azure:compute/offer":          "UbuntuServer",
-	"azure:compute/ostype":         "Linux",
-	"azure:compute/publisher":      "Canonical",
-	"azure:compute/sku":            "18.04-LTS",
-	"azure:compute/subscriptionid": "ebdce8e8-f00-e091c79f86",
-	"azure:compute/version":        "18.04.202103250",
-	"azure:compute/vmid":           "1576434a-f66c-4ffe-abba-44b6a8f8",
-	"azure:compute/vmsize":         "Standard_DS1_v2",
-	"azure:compute/tags":           "baz:bash;foo:bar",
-	"azure:compute/zone":           "testzone",
-	"azure:network/interface/0/ipv4/ipaddress/0/privateipaddress": "10.0.0.4",
-	"azure:network/interface/0/ipv4/ipaddress/0/publicipaddress":  "20.73.42.73",
-	"azure:network/interface/0/ipv4/ipaddress/1/privateipaddress": "10.0.0.5",
-	"azure:network/interface/0/ipv4/ipaddress/1/publicipaddress":  "20.73.42.74",
-	"azure:network/interface/0/ipv4/subnet/0/address":             "10.0.0.0",
-	"azure:network/interface/0/ipv4/subnet/0/prefix":              "24",
-	"azure:network/interface/0/macaddress":                        "0022488250E5",
-	"instance:public-ipv4s":                                       "20.73.42.73,20.73.42.74",
-	"instance:private-ipv4s":                                      "10.0.0.4,10.0.0.5",
+	"cloud.provider":               "azure",
+	"cloud.region":                 "westeurope",
+	"host.type":                    "Standard_DS1_v2",
+	"azure.compute.environment":    "AzurePublicCloud",
+	"azure.compute.location":       "westeurope",
+	"azure.compute.name":           "bar-test",
+	"azure.compute.offer":          "UbuntuServer",
+	"azure.compute.ostype":         "Linux",
+	"azure.compute.publisher":      "Canonical",
+	"azure.compute.sku":            "18.04-LTS",
+	"azure.compute.subscriptionid": "ebdce8e8-f00-e091c79f86",
+	"azure.compute.version":        "18.04.202103250",
+	"azure.compute.vmid":           "1576434a-f66c-4ffe-abba-44b6a8f8",
+	"azure.compute.vmsize":         "Standard_DS1_v2",
+	"azure.compute.tags":           "baz:bash;foo:bar",
+	"azure.compute.zone":           "testzone",
+	"azure.network.interface.0.ipv4.ipaddress.0.privateipaddress": "10.0.0.4",
+	"azure.network.interface.0.ipv4.ipaddress.0.publicipaddress":  "20.73.42.73",
+	"azure.network.interface.0.ipv4.ipaddress.1.privateipaddress": "10.0.0.5",
+	"azure.network.interface.0.ipv4.ipaddress.1.publicipaddress":  "20.73.42.74",
+	"azure.network.interface.0.ipv4.subnet.0.address":             "10.0.0.0",
+	"azure.network.interface.0.ipv4.subnet.0.prefix":              "24",
+	"azure.network.interface.0.macaddress":                        "0022488250E5",
+	"instance.public_ipv4s":                                       "20.73.42.73,20.73.42.74",
+	"instance.private_ipv4s":                                      "10.0.0.4,10.0.0.5",
 }
 
 func TestPopulateResult(t *testing.T) {
@@ -156,13 +160,9 @@ func TestPopulateResult(t *testing.T) {
 
 	azure := strings.NewReader(fakeAzureAnswer)
 
-	if err := json.NewDecoder(azure).Decode(&imds); err != nil {
-		t.Fatalf("Failed to parse Azure metadata: %v", err)
-	}
+	err := json.NewDecoder(azure).Decode(&imds)
+	require.NoError(t, err)
 
 	populateResult(result, &imds)
-
-	if diff := cmp.Diff(expectedResult, result); diff != "" {
-		t.Fatalf("Metadata mismatch (-want +got):\n%s", diff)
-	}
+	assert.Equal(t, expectedResult, result)
 }

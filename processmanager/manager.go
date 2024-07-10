@@ -14,20 +14,24 @@ import (
 	"time"
 
 	lru "github.com/elastic/go-freelru"
+	"github.com/elastic/otel-profiling-agent/config"
 	log "github.com/sirupsen/logrus"
 
 	"github.com/elastic/otel-profiling-agent/host"
 	"github.com/elastic/otel-profiling-agent/interpreter"
+	"github.com/elastic/otel-profiling-agent/interpreter/apmint"
 	"github.com/elastic/otel-profiling-agent/libpf"
-	"github.com/elastic/otel-profiling-agent/libpf/nativeunwind"
-	sdtypes "github.com/elastic/otel-profiling-agent/libpf/nativeunwind/stackdeltatypes"
-	"github.com/elastic/otel-profiling-agent/libpf/periodiccaller"
-	"github.com/elastic/otel-profiling-agent/libpf/traceutil"
 	"github.com/elastic/otel-profiling-agent/lpm"
 	"github.com/elastic/otel-profiling-agent/metrics"
+	"github.com/elastic/otel-profiling-agent/nativeunwind"
+	sdtypes "github.com/elastic/otel-profiling-agent/nativeunwind/stackdeltatypes"
+	"github.com/elastic/otel-profiling-agent/periodiccaller"
 	pmebpf "github.com/elastic/otel-profiling-agent/processmanager/ebpf"
 	eim "github.com/elastic/otel-profiling-agent/processmanager/execinfomanager"
 	"github.com/elastic/otel-profiling-agent/reporter"
+	"github.com/elastic/otel-profiling-agent/tracehandler"
+	"github.com/elastic/otel-profiling-agent/traceutil"
+	"github.com/elastic/otel-profiling-agent/util"
 )
 
 const (
@@ -58,10 +62,11 @@ var (
 
 // New creates a new ProcessManager which is responsible for keeping track of loading
 // and unloading of symbols for processes.
-// Four external interfaces are used to access the processes and related resources: ebpf,
-// fileIDMapper, opener and reportFrameMetadata. Specify 'nil' for these interfaces to use
-// the default implementation.
-func New(ctx context.Context, includeTracers []bool, monitorInterval time.Duration,
+//
+// Three external interfaces are used to access the processes and related resources: ebpf,
+// fileIDMapper and symbolReporter. Specify nil for fileIDMapper to use the default
+// implementation.
+func New(ctx context.Context, includeTracers config.IncludedTracers, monitorInterval time.Duration,
 	ebpf pmebpf.EbpfHandler, fileIDMapper FileIDMapper, symbolReporter reporter.SymbolReporter,
 	sdp nativeunwind.StackDeltaProvider, filterErrorFrames bool) (*ProcessManager, error) {
 	if fileIDMapper == nil {
@@ -72,23 +77,26 @@ func New(ctx context.Context, includeTracers []bool, monitorInterval time.Durati
 		}
 	}
 
-	elfInfoCache, err := lru.New[libpf.OnDiskFileIdentifier, elfInfo](elfInfoCacheSize,
-		libpf.OnDiskFileIdentifier.Hash32)
+	elfInfoCache, err := lru.New[util.OnDiskFileIdentifier, elfInfo](elfInfoCacheSize,
+		util.OnDiskFileIdentifier.Hash32)
 	if err != nil {
 		return nil, fmt.Errorf("unable to create elfInfoCache: %v", err)
 	}
 	elfInfoCache.SetLifetime(elfInfoCacheTTL)
 
-	em := eim.NewExecutableInfoManager(sdp, ebpf, includeTracers)
+	em, err := eim.NewExecutableInfoManager(sdp, ebpf, includeTracers)
+	if err != nil {
+		return nil, fmt.Errorf("unable to create ExecutableInfoManager: %v", err)
+	}
 
-	interpreters := make(map[libpf.PID]map[libpf.OnDiskFileIdentifier]interpreter.Instance)
+	interpreters := make(map[util.PID]map[util.OnDiskFileIdentifier]interpreter.Instance)
 
 	pm := &ProcessManager{
 		interpreterTracerEnabled: em.NumInterpreterLoaders() > 0,
 		eim:                      em,
 		interpreters:             interpreters,
-		exitEvents:               make(map[libpf.PID]libpf.KTime),
-		pidToProcessInfo:         make(map[libpf.PID]*processInfo),
+		exitEvents:               make(map[util.PID]util.KTime),
+		pidToProcessInfo:         make(map[util.PID]*processInfo),
 		ebpf:                     ebpf,
 		FileIDMapper:             fileIDMapper,
 		elfInfoCache:             elfInfoCache,
@@ -186,7 +194,7 @@ func (pm *ProcessManager) symbolizeFrame(frame int, trace *host.Trace,
 	defer pm.mu.Unlock()
 
 	if len(pm.interpreters[trace.PID]) == 0 {
-		return fmt.Errorf("interpreter process gone")
+		return errors.New("interpreter process gone")
 	}
 
 	for _, instance := range pm.interpreters[trace.PID] {
@@ -229,54 +237,49 @@ func (pm *ProcessManager) ConvertTrace(trace *host.Trace) (newTrace *libpf.Trace
 			log.Errorf("Unexpected frame type 0x%02X (neither error nor interpreter frame)",
 				uint8(frame.Type))
 		case libpf.Native, libpf.Kernel:
-			// When unwinding stacks, the address is obtained from the stack
-			// which contains pointer to the *next* instruction to be executed.
+			// The BPF code classifies whether an address is a return address or not.
+			// Return addresses are where execution resumes when returning to the stack
+			// frame and point to the **next instruction** after the call instruction
+			// that produced the frame.
 			//
-			// For all kernel frames, the kernel unwinder will always produce
-			// a frame in which the RIP is after a call instruction (it hides the top
-			// frames that leads to the unwinder itself).
+			// For these return addresses we subtract 1 from the address in order to
+			// make it point into the call that precedes it: the instruction at the
+			// return address may already be part of whatever code follows after the
+			// call, and we want the return addresses to resolve to the call itself
+			// during symbolization.
 			//
-			// For leaf user mode frames (without kernel frames) the RIP from
-			// our unwinder is good as is, and must not be altered because the
-			// previous instruction address is unknown -- we might have just
-			// executed a jump or a call that got us to the address found in
-			// these frames.
-			//
-			// For other user mode frames we are at the next instruction after a
-			// call. And often the next instruction is already part of the next
-			// source code line's debug info areas. So we need to fixup the non-top
-			// frames so that we get source code lines pointing to the call instruction.
-			// We would ideally wish to subtract the size of the instruction from
-			// the return address we retrieved - but the size of calls can vary
-			// (indirect calls etc.). If, on the other hand, we subtract 1 from
-			// the address, we ensure that we fall into the range of addresses
-			// associated with that function call in the debug information.
-			//
-			// The unwinder will produce stack traces like the following:
-			//
-			// Frame 0:
-			// bla %reg           <- address of frame 0
-			// retq
-			//
-			// Frame 1:
-			// call <function>
-			// add %rax, %rbx     <- address of frame 1 == return address of frame 0
-
+			// Optimally we'd subtract the size of the call instruction here instead
+			// of doing `- 1`, but disassembling backwards is quite difficult for
+			// variable length instruction sets like X86.
 			relativeRIP := frame.Lineno
-			if i > 0 || frame.Type.IsInterpType(libpf.Kernel) {
+			if frame.ReturnAddress {
 				relativeRIP--
 			}
+
+			// Locate mapping info for the frame.
+			var mappingStart, mappingEnd libpf.Address
+			var fileOffset uint64
+			if frame.Type.Interpreter() == libpf.Native {
+				if mapping, ok := pm.findMappingForTrace(trace.PID, frame.File, frame.Lineno); ok {
+					mappingStart = mapping.Vaddr - libpf.Address(mapping.Bias)
+					mappingEnd = mappingStart + libpf.Address(mapping.Length)
+					fileOffset = mapping.FileOffset
+				}
+			}
+
 			fileID, ok := pm.FileIDMapper.Get(frame.File)
 			if !ok {
 				log.Debugf(
 					"file ID lookup failed for PID %d, frame %d/%d, frame type %d",
 					trace.PID, i, traceLen, frame.Type)
 
-				newTrace.AppendFrame(frame.Type, libpf.UnsymbolizedFileID,
-					libpf.AddressOrLineno(0))
+				newTrace.AppendFrameFull(frame.Type, libpf.UnsymbolizedFileID,
+					libpf.AddressOrLineno(0), mappingStart, mappingEnd, fileOffset)
 				continue
 			}
-			newTrace.AppendFrame(frame.Type, fileID, relativeRIP)
+
+			newTrace.AppendFrameFull(frame.Type, fileID,
+				relativeRIP, mappingStart, mappingEnd, fileOffset)
 		default:
 			err := pm.symbolizeFrame(i, trace, newTrace)
 			if err != nil {
@@ -292,11 +295,59 @@ func (pm *ProcessManager) ConvertTrace(trace *host.Trace) (newTrace *libpf.Trace
 	return newTrace
 }
 
-func (pm *ProcessManager) SymbolizationComplete(traceCaptureKTime libpf.KTime) {
+// findMappingForTrace locates the mapping for a given host trace.
+func (pm *ProcessManager) findMappingForTrace(pid util.PID, fid host.FileID,
+	addr libpf.AddressOrLineno) (m Mapping, found bool) {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+
+	procInfo, ok := pm.pidToProcessInfo[pid]
+	if !ok {
+		return Mapping{}, false
+	}
+
+	fidMappings, ok := procInfo.mappingsByFileID[fid]
+	if !ok {
+		return Mapping{}, false
+	}
+
+	for _, candidate := range fidMappings {
+		procSpaceVA := libpf.Address(uint64(addr) + candidate.Bias)
+		mappingEnd := candidate.Vaddr + libpf.Address(candidate.Length)
+		if procSpaceVA >= candidate.Vaddr && procSpaceVA <= mappingEnd {
+			return *candidate, true
+		}
+	}
+
+	return Mapping{}, false
+}
+
+func (pm *ProcessManager) MaybeNotifyAPMAgent(
+	rawTrace *host.Trace, umTraceHash libpf.TraceHash, count uint16) string {
+	pidInterp, ok := pm.interpreters[rawTrace.PID]
+	if !ok {
+		return ""
+	}
+
+	var serviceName string
+	for _, mapping := range pidInterp {
+		if apm, ok := mapping.(*apmint.Instance); ok {
+			apm.NotifyAPMAgent(rawTrace.PID, rawTrace, umTraceHash, count)
+
+			// It's pretty unusual for there to be more than one APM agent in a
+			// single process, but in case there is, just pick the last one.
+			serviceName = apm.APMServiceName()
+		}
+	}
+
+	return serviceName
+}
+
+func (pm *ProcessManager) SymbolizationComplete(traceCaptureKTime util.KTime) {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
-	nowKTime := libpf.GetKTime()
+	nowKTime := util.GetKTime()
 
 	for pid, pidExitKTime := range pm.exitEvents {
 		if pidExitKTime > traceCaptureKTime {
@@ -314,6 +365,9 @@ func (pm *ProcessManager) SymbolizationComplete(traceCaptureKTime libpf.KTime) {
 		log.Debugf("PID %v exit latency %v ms", pid, (nowKTime-pidExitKTime)/1e6)
 	}
 }
+
+// Compile time check to make sure we satisfy the interface.
+var _ tracehandler.TraceProcessor = (*ProcessManager)(nil)
 
 // AddSynthIntervalData adds synthetic stack deltas to the manager. This is useful for cases where
 // populating the information via the stack delta provider isn't viable, for example because the

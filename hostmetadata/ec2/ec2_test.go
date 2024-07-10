@@ -7,13 +7,15 @@
 package ec2
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/ec2metadata"
-	"github.com/aws/aws-sdk-go/service/ec2"
-	"github.com/google/go-cmp/cmp"
+	ec2imds "github.com/aws/aws-sdk-go-v2/feature/ec2/imds"
+	ec2service "github.com/aws/aws-sdk-go-v2/service/ec2"
+	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
+
+	"github.com/stretchr/testify/assert"
 )
 
 type fakeEC2Metadata struct {
@@ -21,10 +23,10 @@ type fakeEC2Metadata struct {
 }
 
 type fakeEC2Tags struct {
-	tags []*ec2.TagDescription
+	tags []ec2types.TagDescription
 }
 
-func (e *fakeEC2Metadata) GetMetadata(path string) (string, error) {
+func (e *fakeEC2Metadata) FetchMetadata(path string) (string, error) {
 	value, found := e.metadata[path]
 	if !found {
 		return "", fmt.Errorf("%s not found", path)
@@ -33,14 +35,14 @@ func (e *fakeEC2Metadata) GetMetadata(path string) (string, error) {
 	return value, nil
 }
 
-func (e *fakeEC2Metadata) GetInstanceIdentityDocument() (ec2metadata.EC2InstanceIdentityDocument,
-	error) {
-	return ec2metadata.EC2InstanceIdentityDocument{}, nil
+func (e *fakeEC2Metadata) FetchInstanceIdentityDocument() (
+	ec2imds.InstanceIdentityDocument, error) {
+	return ec2imds.InstanceIdentityDocument{}, nil
 }
 
-func (e *fakeEC2Tags) DescribeTags(_ *ec2.DescribeTagsInput,
-) (*ec2.DescribeTagsOutput, error) {
-	return &ec2.DescribeTagsOutput{Tags: e.tags}, nil
+func (e *fakeEC2Tags) DescribeTags(context.Context, *ec2service.DescribeTagsInput,
+	...func(*ec2service.Options)) (*ec2service.DescribeTagsOutput, error) {
+	return &ec2service.DescribeTagsOutput{Tags: e.tags}, nil
 }
 
 func TestAddMetadata(t *testing.T) {
@@ -79,14 +81,14 @@ func TestAddMetadata(t *testing.T) {
 	}
 
 	ec2Client = &fakeEC2Tags{
-		tags: []*ec2.TagDescription{
+		tags: []ec2types.TagDescription{
 			{
-				Key:   aws.String("foo"),
-				Value: aws.String("bar"),
+				Key:   stringPtr("foo"),
+				Value: stringPtr("bar"),
 			},
 			{
-				Key:   aws.String("baz"),
-				Value: aws.String("value1-value2"),
+				Key:   stringPtr("baz"),
+				Value: stringPtr("value1-value2"),
 			},
 		},
 	}
@@ -95,41 +97,42 @@ func TestAddMetadata(t *testing.T) {
 	AddMetadata(result)
 
 	expected := map[string]string{
-		"ec2:ami-id":              "ami-1234",
-		"ec2:ami-manifest-path":   "(unknown)",
-		"ec2:ancestor-ami-ids":    "ami-2345",
-		"ec2:hostname":            "ec2.internal",
-		"ec2:instance-id":         "i-abcdef",
-		"ec2:instance-type":       "m5.large",
-		"ec2:instance-life-cycle": "on-demand",
-		"ec2:local-hostname":      "compute-internal",
-		"ec2:local-ipv4":          "172.16.1.1",
-		"ec2:kernel-id":           "aki-1419e57b",
-		"ec2:mac":                 "0e:0f:00:01:02:03",
-		"ec2:profile":             "default-hvm",
-		"ec2:public-hostname":     "ec2-10-eu-west-1.compute.amazonaws.com",
-		"ec2:public-ipv4":         "1.2.3.4",
-		"ec2:product-codes":       "foobarbaz",
-		"ec2:security-groups":     "default\nlaunch-wizard-1",
+		"cloud.provider":          "aws",
+		"cloud.region":            "us-east-2",
+		"host.type":               "m5.large",
+		"ec2.ami_id":              "ami-1234",
+		"ec2.ami_manifest_path":   "(unknown)",
+		"ec2.ancestor_ami_ids":    "ami-2345",
+		"ec2.hostname":            "ec2.internal",
+		"ec2.instance_id":         "i-abcdef",
+		"ec2.instance_type":       "m5.large",
+		"ec2.instance_life_cycle": "on-demand",
+		"ec2.local_hostname":      "compute-internal",
+		"ec2.local_ipv4":          "172.16.1.1",
+		"ec2.kernel_id":           "aki-1419e57b",
+		"ec2.mac":                 "0e:0f:00:01:02:03",
+		"ec2.profile":             "default-hvm",
+		"ec2.public_hostname":     "ec2-10-eu-west-1.compute.amazonaws.com",
+		"ec2.public_ipv4":         "1.2.3.4",
+		"ec2.product_codes":       "foobarbaz",
+		"ec2.security_groups":     "default\nlaunch-wizard-1",
 
-		"ec2:placement/availability-zone":    "us-east-2c",
-		"ec2:placement/availability-zone-id": "use2-az3",
-		"ec2:placement/region":               "us-east-2",
+		"ec2.placement.availability_zone":    "us-east-2c",
+		"ec2.placement.availability_zone_id": "use2-az3",
+		"ec2.placement.region":               "us-east-2",
 
-		"ec2:network/interfaces/macs/123/device-number":             "1",
-		"ec2:network/interfaces/macs/456/local-ipv4s":               "1.2.3.4\n5.6.7.8",
-		"ec2:network/interfaces/macs/456/public-ipv4s":              "9.9.9.9\n8.8.8.8",
-		"ec2:network/interfaces/macs/789/ipv4-associations/4.4.4.4": "44.44.44.44",
-		"ec2:network/interfaces/macs/789/ipv4-associations/7.7.7.7": "77.77.77.77",
-		"ec2:network/interfaces/macs/789/public-ipv4s":              "4.3.2.1",
+		"ec2.network.interfaces.macs.123.device_number":             "1",
+		"ec2.network.interfaces.macs.456.local_ipv4s":               "1.2.3.4\n5.6.7.8",
+		"ec2.network.interfaces.macs.456.public_ipv4s":              "9.9.9.9\n8.8.8.8",
+		"ec2.network.interfaces.macs.789.ipv4_associations.4.4.4.4": "44.44.44.44",
+		"ec2.network.interfaces.macs.789.ipv4_associations.7.7.7.7": "77.77.77.77",
+		"ec2.network.interfaces.macs.789.public_ipv4s":              "4.3.2.1",
 
-		"ec2:tags/foo":           "bar",
-		"ec2:tags/baz":           "value1-value2",
-		"instance:private-ipv4s": "1.2.3.4,5.6.7.8",
-		"instance:public-ipv4s":  "9.9.9.9,8.8.8.8,4.3.2.1",
+		"ec2.tags.foo":           "bar",
+		"ec2.tags.baz":           "value1-value2",
+		"instance.private_ipv4s": "1.2.3.4,5.6.7.8",
+		"instance.public_ipv4s":  "9.9.9.9,8.8.8.8,4.3.2.1",
 	}
 
-	if diff := cmp.Diff(expected, result); diff != "" {
-		t.Fatalf("Metadata mismatch (-want +got):\n%s", diff)
-	}
+	assert.Equal(t, expected, result)
 }

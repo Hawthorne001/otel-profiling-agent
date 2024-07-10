@@ -8,6 +8,7 @@ package host
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -19,30 +20,31 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/elastic/otel-profiling-agent/pfnamespaces"
+
 	"github.com/jsimonetti/rtnetlink"
 	log "github.com/sirupsen/logrus"
 	"github.com/syndtr/gocapability/capability"
-	"go.uber.org/multierr"
 	"golang.org/x/sys/unix"
 
-	"github.com/elastic/otel-profiling-agent/config"
 	"github.com/elastic/otel-profiling-agent/libpf"
-	"github.com/elastic/otel-profiling-agent/libpf/pfnamespaces"
 )
 
 // Host metadata keys
 // Changing these values is a customer-visible change.
 const (
-	KeyKernelProcVersion = "host:kernel_proc_version"
-	KeyKernelVersion     = "host:kernel_version"
-	KeyHostname          = "host:hostname"
-	KeyMachine           = "host:machine"
-	KeyIPAddress         = "host:ip"
+	// TODO: Change to semconv / ECS names
+	KeyKernelVersion      = "profiling.host.kernel_version"
+	KeyKernelProcVersion  = "profiling.host.kernel_proc_version"
+	KeyHostname           = "profiling.host.name"
+	KeyArchitecture       = "host.arch"
+	KeyArchitectureCompat = "profiling.host.machine"
+	KeyIPAddress          = "profiling.host.ip"
 
 	// Prefix for all the sysctl keys
-	keyPrefixSysctl = "host:sysctl/"
+	keyPrefixSysctl = "profiling.host.sysctl."
 
-	keyTags = "host:tags"
+	keyTags = "profiling.host.tags"
 )
 
 // Various sysctls we are interested in.
@@ -53,7 +55,10 @@ var sysctls = []string{
 	"kernel.unprivileged_bpf_disabled",
 }
 
-var ValidTagRegex = regexp.MustCompile(`^[a-zA-Z0-9-:._]+$`)
+var (
+	validTagRegex = regexp.MustCompile(`^[a-zA-Z0-9-:._]+$`)
+	validatedTags string
+)
 
 // AddMetadata adds host metadata to the result map, that is common across all environments.
 // The IP address and hostname (part of the returned metadata) are evaluated in the context of
@@ -68,7 +73,6 @@ func AddMetadata(caEndpoint string, result map[string]string) error {
 		host = caEndpoint
 	}
 
-	validatedTags := config.ValidatedTags()
 	if validatedTags != "" {
 		result[keyTags] = validatedTags
 	}
@@ -148,18 +152,17 @@ func AddMetadata(caEndpoint string, result map[string]string) error {
 		for _, sysctl := range sysctls {
 			sysctlValue, err2 := getSysctl(sysctl)
 			if err2 != nil {
-				errResult = multierr.Combine(errResult, err2)
+				errResult = errors.Join(errResult, err2)
 				continue
 			}
-			sysctlKey := keyPrefixSysctl + sysctl
-			result[sysctlKey] = sanitizeString(sysctlValue)
+			result[keyPrefixSysctl+sysctl] = sanitizeString(sysctlValue)
 		}
 
 		// Get IP address
 		var ip net.IP
 		ip, err = getSourceIPAddress(host)
 		if err != nil {
-			errResult = multierr.Combine(errResult, err)
+			errResult = errors.Join(errResult, err)
 		} else {
 			result[KeyIPAddress] = ip.String()
 		}
@@ -167,11 +170,26 @@ func AddMetadata(caEndpoint string, result map[string]string) error {
 		// Get uname-related metadata: hostname and kernel version
 		uname := &unix.Utsname{}
 		if err = unix.Uname(uname); err != nil {
-			errResult = multierr.Combine(errResult, fmt.Errorf("error calling uname: %v", err))
+			errResult = errors.Join(errResult, fmt.Errorf("error calling uname: %v", err))
 		} else {
 			result[KeyKernelVersion] = sanitizeString(uname.Release[:])
 			result[KeyHostname] = sanitizeString(uname.Nodename[:])
-			result[KeyMachine] = sanitizeString(uname.Machine[:])
+
+			machine := sanitizeString(uname.Machine[:])
+
+			// Keep sending the old field for compatibility between old collectors and new agents.
+			result[KeyArchitectureCompat] = machine
+
+			// Convert to OTEL semantic conventions.
+			// Machine values other than x86_64, aarch64 are not converted.
+			switch machine {
+			case "x86_64":
+				result[KeyArchitecture] = "amd64"
+			case "aarch64":
+				result[KeyArchitecture] = "arm64"
+			default:
+				result[KeyArchitecture] = machine
+			}
 		}
 	}()
 
@@ -182,6 +200,11 @@ func AddMetadata(caEndpoint string, result map[string]string) error {
 	}
 
 	return nil
+}
+
+// ValidTagRegex returns the regular expression used to validate user-specified tags.
+func ValidTagRegex() *regexp.Regexp {
+	return validTagRegex
 }
 
 const keySuffixCPUSocketID = "socketIDs"
@@ -251,7 +274,7 @@ func addressFamily(ip net.IP) (uint8, error) {
 func getSourceIPAddress(domain string) (net.IP, error) {
 	conn, err := rtnetlink.Dial(nil)
 	if err != nil {
-		return nil, fmt.Errorf("unable to open netlink connection")
+		return nil, errors.New("unable to open netlink connection")
 	}
 	defer conn.Close()
 
@@ -325,11 +348,11 @@ func getSourceIPAddress(domain string) (net.IP, error) {
 func hasCapSysAdmin() (bool, error) {
 	caps, err := capability.NewPid2(0) // 0 == current process
 	if err != nil {
-		return false, fmt.Errorf("unable to get process capabilities")
+		return false, errors.New("unable to get process capabilities")
 	}
 	err = caps.Load()
 	if err != nil {
-		return false, fmt.Errorf("unable to load process capabilities")
+		return false, errors.New("unable to load process capabilities")
 	}
 	return caps.Get(capability.EFFECTIVE, capability.CAP_SYS_ADMIN), nil
 }
@@ -363,32 +386,29 @@ func getSysctl(sysctl string) ([]byte, error) {
 	return contents, nil
 }
 
-// ValidateTags parses and validates user-specified tags.
+// SetTags parses and validates user-specified tags and sets them for use in host metadata.
 // Each tag must match ValidTagRegex with ';' used as a separator.
 // Tags that can't be validated are dropped.
-// The empty string is returned if no tags can be validated.
-func ValidateTags(tags string) string {
+func SetTags(tags string) {
 	if tags == "" {
-		return ""
+		validatedTags = ""
+		return
 	}
 
 	splitTags := strings.Split(tags, ";")
-	validatedTags := make([]string, 0, len(splitTags))
+	validTags := make([]string, 0, len(splitTags))
 
 	for _, tag := range splitTags {
-		if !ValidTagRegex.MatchString(tag) {
+		if !validTagRegex.MatchString(tag) {
 			log.Warnf("Rejected user-specified tag '%s' since it doesn't match regexp '%v'",
-				tag, ValidTagRegex)
+				tag, validTagRegex)
 		} else {
-			validatedTags = append(validatedTags, tag)
+			validTags = append(validTags, tag)
 		}
 	}
 
-	if len(validatedTags) > 0 {
-		return strings.Join(validatedTags, ";")
-	}
-
-	return ""
+	validatedTags = strings.Join(validTags, ";")
+	log.Debugf("Validated tags: %s", validatedTags)
 }
 
 // tryEnterRootNamespaces tries to enter PID 1's UTS and network namespaces.

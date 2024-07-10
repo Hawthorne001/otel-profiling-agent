@@ -15,11 +15,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/elastic/otel-profiling-agent/hostmetadata/instance"
 	log "github.com/sirupsen/logrus"
+
+	"github.com/elastic/otel-profiling-agent/hostmetadata/instance"
 )
 
-const azurePrefix = "azure:"
+const azurePrefix = "azure."
 
 // Compute stores computing related metadata information of an Azure instance.
 type Compute struct {
@@ -132,6 +133,8 @@ func AddMetadata(result map[string]string) {
 // populateResult converts the given answer from Azure in imds into
 // our internal representation in result.
 func populateResult(result map[string]string, imds *IMDS) {
+	result[instance.KeyCloudProvider] = "azure"
+
 	v := reflect.ValueOf(imds.Compute)
 	t := reflect.TypeOf(imds.Compute)
 	for i := 0; i < v.NumField(); i++ {
@@ -141,8 +144,11 @@ func populateResult(result map[string]string, imds *IMDS) {
 			// Don't store empty values.
 			continue
 		}
-		result[azurePrefix+"compute/"+strings.ToLower(fieldName)] = fieldValue
+		result[azurePrefix+"compute."+toFieldName(strings.ToLower(fieldName))] = fieldValue
 	}
+
+	addCloudRegion(result)
+	addHostType(result)
 
 	// Used to temporarily hold synthetic metadata
 	ipAddrs := map[string][]string{
@@ -153,10 +159,10 @@ func populateResult(result map[string]string, imds *IMDS) {
 	}
 
 	for i, iface := range imds.Network.Interface {
-		result[azurePrefix+"network/interface/"+fmt.Sprintf("%d/macaddress", i)] = iface.Mac
+		result[azurePrefix+"network.interface."+fmt.Sprintf("%d.macaddress", i)] = iface.Mac
 		for j, ipv4 := range iface.IPv4.Addr {
-			keyPrefix := azurePrefix + "network/interface/" +
-				fmt.Sprintf("%d/ipv4/ipaddress/%d/", i, j)
+			keyPrefix := azurePrefix + "network.interface." +
+				fmt.Sprintf("%d.ipv4.ipaddress.%d.", i, j)
 			if ipv4.PrivateIP != "" {
 				result[keyPrefix+"privateipaddress"] = ipv4.PrivateIP
 				ipAddrs[instance.KeyPrivateIPV4s] = append(ipAddrs[instance.KeyPrivateIPV4s],
@@ -169,8 +175,8 @@ func populateResult(result map[string]string, imds *IMDS) {
 			}
 		}
 		for j, netv4 := range iface.IPv4.Subnet {
-			keyPrefix := azurePrefix + "network/interface/" +
-				fmt.Sprintf("%d/ipv4/subnet/%d/", i, j)
+			keyPrefix := azurePrefix + "network.interface." +
+				fmt.Sprintf("%d.ipv4.subnet.%d.", i, j)
 			if netv4.Address != "" {
 				result[keyPrefix+"address"] = netv4.Address
 			}
@@ -179,8 +185,8 @@ func populateResult(result map[string]string, imds *IMDS) {
 			}
 		}
 		for j, ipv6 := range iface.IPv6.Addr {
-			keyPrefix := azurePrefix + "network/interface/" +
-				fmt.Sprintf("%d/ipv6/ipaddress/%d/", i, j)
+			keyPrefix := azurePrefix + "network.interface." +
+				fmt.Sprintf("%d.ipv6.ipaddress.%d.", i, j)
 			if ipv6.PrivateIP != "" {
 				result[keyPrefix+"privateipaddress"] = ipv6.PrivateIP
 				ipAddrs[instance.KeyPrivateIPV6s] = append(ipAddrs[instance.KeyPrivateIPV6s],
@@ -193,8 +199,8 @@ func populateResult(result map[string]string, imds *IMDS) {
 			}
 		}
 		for j, netv6 := range iface.IPv6.Subnet {
-			keyPrefix := azurePrefix + "network/interface/" +
-				fmt.Sprintf("%d/ipv6/subnet/%d/", i, j)
+			keyPrefix := azurePrefix + "network.interface." +
+				fmt.Sprintf("%d.ipv6.subnet.%d.", i, j)
 			if netv6.Address != "" {
 				result[keyPrefix+"address"] = netv6.Address
 			}
@@ -205,4 +211,24 @@ func populateResult(result map[string]string, imds *IMDS) {
 	}
 
 	instance.AddToResult(ipAddrs, result)
+}
+
+func addCloudRegion(result map[string]string) {
+	// example: "azure.compute.location": "eastus2"
+	if region, ok := result[azurePrefix+"compute.location"]; ok {
+		result[instance.KeyCloudRegion] = region
+	}
+}
+
+func addHostType(result map[string]string) {
+	// example: "azure.compute.vmsize": "Standard_D2s_v3"
+	if hostType, ok := result[azurePrefix+"compute.vmsize"]; ok {
+		result[instance.KeyHostType] = hostType
+	}
+}
+
+func toFieldName(s string) string {
+	return strings.ReplaceAll(
+		strings.ReplaceAll(s, "-", "_"),
+		"/", ".")
 }
